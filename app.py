@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 import re
 
-import feedparser
 import pandas as pd
 import streamlit as st
 
@@ -72,13 +73,6 @@ RISK_RULES = [
     },
 ]
 
-TRUSTED_SOURCES = [
-    "bursa efek indonesia", "idx", "kementerian esdm", "skk migas",
-    "kementerian pupr", "bps", "antara", "reuters", "bloomberg",
-    "bisnis.com", "kontan", "cnbc indonesia",
-]
-
-
 def clean_text(value):
     value = re.sub(r"<[^>]+>", " ", str(value or ""))
     return re.sub(r"\s+", " ", value.lower()).strip()
@@ -100,17 +94,25 @@ def fetch_rss(query, limit=30):
         "https://news.google.com/rss/search?q=" + quote_plus(query)
         + "&hl=id&gl=ID&ceid=ID:id"
     )
-    feed = feedparser.parse(url)
+    request = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 SIRENA-MI3/1.0"},
+    )
+    with urlopen(request, timeout=20) as response:
+        root = ET.fromstring(response.read())
+
     rows = []
-    for entry in feed.entries[:limit]:
-        source = entry.get("source", {})
-        source_name = source.get("title", "") if isinstance(source, dict) else ""
+    for entry in root.findall(".//item")[:limit]:
+        def value(tag):
+            element = entry.find(tag)
+            return element.text.strip() if element is not None and element.text else ""
+
         rows.append({
-            "Judul": entry.get("title", ""),
-            "Ringkasan": entry.get("summary", ""),
-            "URL": entry.get("link", ""),
-            "Tanggal": parse_date(entry.get("published", "")),
-            "Sumber": source_name,
+            "Judul": value("title"),
+            "Ringkasan": value("description"),
+            "URL": value("link"),
+            "Tanggal": parse_date(value("pubDate")),
+            "Sumber": value("source"),
         })
     return rows
 
@@ -129,17 +131,6 @@ def analyze_article(article, sector):
         if matches and rule["materiality"] > selected["materiality"]:
             selected = {**rule, "matches": matches}
 
-    source_text = clean_text(article["Sumber"])
-    source_score = 15 if any(source in source_text for source in TRUSTED_SOURCES) else 7
-
-    recency_score = 0
-    if article["Tanggal"]:
-        days = max(0, (datetime.now(timezone.utc) - article["Tanggal"]).days)
-        recency_score = 10 if days <= 2 else 8 if days <= 7 else 5 if days <= 30 else 2 if days <= 90 else 0
-
-    score = min(100, 30 + selected["materiality"] + source_score + recency_score)
-    priority = "Tinggi" if score >= 75 else "Menengah" if score >= 55 else "Rendah"
-
     return {
         **article,
         "Sektor": sector,
@@ -147,8 +138,6 @@ def analyze_article(article, sector):
         "Tema risiko": selected["theme"],
         "Indikasi dampak": selected["impact"],
         "Kata kunci": ", ".join(selected["matches"]),
-        "Skor": score,
-        "Prioritas": priority,
     }
 
 
@@ -181,16 +170,11 @@ st.markdown(
 tab_news, tab_method = st.tabs(["Monitoring Berita", "Metodologi"])
 
 with tab_news:
-    col1, col2, col3 = st.columns([1.5, 1, 1])
+    col1, col2 = st.columns([2, 1])
     with col1:
         sector = st.selectbox("Sektor", ["Semua sektor", *SECTORS.keys()])
     with col2:
         period = st.selectbox("Jumlah berita per sektor", [10, 20, 30, 50], index=1)
-    with col3:
-        priorities = st.multiselect(
-            "Prioritas", ["Tinggi", "Menengah", "Rendah"], default=["Tinggi", "Menengah"]
-        )
-
     if st.button("Perbarui berita", type="primary", use_container_width=True):
         with st.spinner("Mengambil berita publik terbaru..."):
             data = pd.DataFrame(collect_news(sector, period))
@@ -198,21 +182,19 @@ with tab_news:
         if data.empty:
             st.warning("Berita belum ditemukan atau sumber tidak dapat diakses.")
         else:
-            data = data.sort_values(["Skor", "Tanggal"], ascending=[False, False], na_position="last")
-            filtered = data[data["Prioritas"].isin(priorities)]
+            data = data.sort_values("Tanggal", ascending=False, na_position="last")
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Berita ditemukan", len(data))
-            m2.metric("Prioritas tinggi", int((data["Prioritas"] == "Tinggi").sum()))
-            m3.metric("Prioritas menengah", int((data["Prioritas"] == "Menengah").sum()))
+            m2.metric("Sektor dipantau", int(data["Sektor"].nunique()))
+            m3.metric("Tema teridentifikasi", int(data["Tema risiko"].nunique()))
 
-            for _, row in filtered.iterrows():
+            for _, row in data.iterrows():
                 with st.container(border=True):
                     st.markdown(f"### [{row['Judul']}]({row['URL']})")
-                    c1, c2, c3 = st.columns(3)
+                    c1, c2 = st.columns(2)
                     c1.write(f"**Sektor:** {row['Sektor']}")
                     c2.write(f"**Tema:** {row['Tema risiko']}")
-                    c3.write(f"**Prioritas:** {row['Prioritas']} ({row['Skor']})")
                     st.write(f"**Jenis usaha yang perlu ditinjau:** {row['Jenis usaha yang perlu ditinjau']}")
                     st.write(f"**Indikasi dampak:** {row['Indikasi dampak']}")
                     date_text = row["Tanggal"].strftime("%d-%m-%Y") if pd.notna(row["Tanggal"]) else "Tanggal tidak tersedia"
@@ -221,24 +203,29 @@ with tab_news:
             export_cols = [
                 "Judul", "Tanggal", "Sumber", "URL", "Sektor",
                 "Jenis usaha yang perlu ditinjau", "Tema risiko",
-                "Indikasi dampak", "Skor", "Prioritas",
+                "Indikasi dampak",
             ]
-            csv = filtered[export_cols].to_csv(index=False).encode("utf-8-sig")
+            csv = data[export_cols].to_csv(index=False).encode("utf-8-sig")
             st.download_button("Unduh hasil ke CSV", csv, "monitoring_berita_MI3.csv", "text/csv")
     else:
         st.info("Pilih sektor lalu tekan Perbarui berita.")
 
 with tab_method:
-    st.subheader("Metodologi prioritas")
+    st.subheader("Cara kerja klasifikasi")
     st.dataframe(
         pd.DataFrame({
-            "Komponen": ["Relevansi sektor", "Materialitas tema", "Kredibilitas sumber", "Kebaruan berita"],
-            "Skor maksimum": [30, 25, 15, 10],
+            "Tahap": ["Pengambilan berita", "Klasifikasi sektor", "Identifikasi tema", "Review CRM"],
+            "Proses": [
+                "Mengambil berita publik melalui RSS",
+                "Mencocokkan berita dengan kata kunci sektor MI3",
+                "Mengelompokkan isu regulasi, operasional, pasar, kontrak, keuangan, atau legal",
+                "CRM membuka tautan dan memvalidasi dampaknya terhadap debitur",
+            ],
         }),
         hide_index=True,
         use_container_width=True,
     )
     st.info(
-        "Indikasi dampak berasal dari aturan kata kunci yang terlihat pada kode. "
-        "CRM harus membuka sumber berita sebelum menggunakan informasi dalam analisis kredit."
+        "Semua berita ditampilkan berdasarkan tanggal terbaru. Indikasi dampak berasal dari aturan kata kunci. "
+        "CRM tetap membuka sumber dan memvalidasi informasi sebelum menggunakannya dalam analisis kredit."
     )

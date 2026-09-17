@@ -11,7 +11,7 @@ Website monitoring berita untuk sektor Mining & Energy, Oil & Gas, Construction,
 5. Isi main file path dengan `app.py`.
 6. Klik **Deploy**.
 
-Website mengambil berita publik melalui Google News RSS ketika tombol **Perbarui berita** ditekan. Cache diperbarui paling cepat setiap 30 menit.
+Website mengambil berita publik melalui Google News RSS ketika tombol **Perbarui berita** ditekan. Cache diperbarui paling cepat setiap 30 menit. Berita ditampilkan berdasarkan tanggal terbaru tanpa skor atau label prioritas.
 
 ## Catatan
 
